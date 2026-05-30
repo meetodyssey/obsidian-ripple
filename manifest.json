@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-ripple",
+  "name": "Ripple Search",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Ripple-powered knowledge graph search with activation propagation, update impact analysis, and interactive heatmap visualization.",
+  "author": "Odyssey Team",
+  "authorUrl": "https://github.com/meetodyssey",
+  "isDesktopOnly": false
+}

@@ -1,0 +1,1 @@
+echo 'ER_LLM_API_KEY=sk-7478f0742f9b4a399bd51d2c30a6f648' > .env

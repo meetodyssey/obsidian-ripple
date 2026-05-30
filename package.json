@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-ripple",
+  "version": "0.1.0",
+  "description": "Ripple-powered knowledge graph search and update propagation for Obsidian vaults",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "d3-force": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/d3-force": "^3.0.9",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "latest",
+    "typescript": "^5.4.0"
+  }
+}

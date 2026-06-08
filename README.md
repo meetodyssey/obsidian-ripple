@@ -96,4 +96,4 @@ VaultIndexer  →  KnowledgeGraph (in-memory)  →  RippleEngine
 
 ## License
 
-GNU AGPL3.0
+AGPL-3.0 — see [LICENSE](LICENSE) for details.

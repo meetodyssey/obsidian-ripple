@@ -1,4 +1,4 @@
-import { App, SuggestModal } from "obsidian";
+import { App, SuggestModal, TFile, WorkspaceLeaf } from "obsidian";
 import { SearchResult, RankedResult } from "../types";
 
 /**
@@ -58,11 +58,29 @@ export class RippleSearchModal extends SuggestModal<RankedResult> {
     }
   }
 
-  onChooseSuggestion(item: RankedResult): void {
+  async onChooseSuggestion(item: RankedResult): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(item.notePath);
-    if (file) {
-      this.app.workspace.getLeaf().openFile(file as any);
+    if (file instanceof TFile) {
+      await this.openFileOnce(file);
     }
+  }
+
+  private async openFileOnce(file: TFile): Promise<void> {
+    const existing = this.findOpenLeaf(file.path);
+    if (existing) {
+      this.app.workspace.revealLeaf(existing);
+      return;
+    }
+
+    await this.app.workspace.getLeaf(false).openFile(file);
+  }
+
+  private findOpenLeaf(path: string): WorkspaceLeaf | null {
+    return (
+      this.app.workspace
+        .getLeavesOfType("markdown")
+        .find((leaf) => (leaf.view as any)?.file?.path === path) ?? null
+    );
   }
 
   // Add heatmap button to modal header.

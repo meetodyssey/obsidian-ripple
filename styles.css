@@ -111,12 +111,15 @@
   flex: 1;
   overflow: hidden;
   min-height: 0;
+  background: var(--background-primary);
 }
 
 .ripple-heatmap-canvas-container canvas {
   display: block;
   width: 100%;
   height: 100%;
+  background: var(--background-primary);
+  touch-action: none;
 }
 
 /* ── Status bar badge ─────────────────────────────── */

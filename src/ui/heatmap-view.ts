@@ -1,26 +1,18 @@
-import { ItemView, WorkspaceLeaf } from "obsidian";
-import {
-  forceSimulation,
-  forceLink,
-  forceManyBody,
-  forceCenter,
-  forceCollide,
-  SimulationNodeDatum,
-  SimulationLinkDatum,
-} from "d3-force";
+import { ItemView, TFile, WorkspaceLeaf } from "obsidian";
 import { SearchResult, LayoutPosition } from "../types";
 import { KnowledgeGraph } from "../graph/knowledge-graph";
 import { RippleEngine } from "../engine/ripple-engine";
 
 export const HEATMAP_VIEW_TYPE = "ripple-heatmap-view";
 
-interface LayoutNode extends SimulationNodeDatum {
-  id: string;
-  title: string;
-}
-
-interface LayoutLink extends SimulationLinkDatum<LayoutNode> {
-  weight: number;
+interface HeatmapTheme {
+  bg: string;
+  grid: string;
+  edge: string;
+  node: string;
+  nodeInactive: string;
+  text: string;
+  textFaint: string;
 }
 
 /**
@@ -48,6 +40,15 @@ export class RippleHeatmapView extends ItemView {
   private dragging = false;
   private dragStart = { x: 0, y: 0 };
   private dragOffset = { x: 0, y: 0 };
+  private dragNode: {
+    path: string;
+    nodeStartX: number;
+    nodeStartY: number;
+    graphStartX: number;
+    graphStartY: number;
+  } | null = null;
+  private cleanupFns: Array<() => void> = [];
+  private resizeObserver: ResizeObserver | null = null;
 
   constructor(leaf: WorkspaceLeaf, graph: KnowledgeGraph, engine: RippleEngine) {
     super(leaf);
@@ -70,6 +71,8 @@ export class RippleHeatmapView extends ItemView {
   // ── Lifecycle ────────────────────────────────────────────
 
   async onOpen(): Promise<void> {
+    this.cleanupEventHandlers();
+
     const container = this.containerEl.children[1] as HTMLElement;
     container.empty();
     container.style.display = "flex";
@@ -123,6 +126,7 @@ export class RippleHeatmapView extends ItemView {
         const query = (e.target as HTMLInputElement).value;
         if (query.trim()) {
           this.searchResult = this.engine.search(query);
+          this.fitToSearchResult(this.searchResult);
           this.startAnimation();
         }
       }
@@ -155,143 +159,343 @@ export class RippleHeatmapView extends ItemView {
     let dragMoved = false;
     let lastMouseDown: { clientX: number; clientY: number } | null = null;
     // ── Mouse: pan + click on canvas ────────────────────
-    this.canvas.addEventListener("mousedown", (e) => {
+    this.addDomListener(this.canvas, "mousedown", (e) => {
       dragMoved = false;
       lastMouseDown = { clientX: e.clientX, clientY: e.clientY };
       this.dragging = true;
       this.dragStart = { x: e.clientX, y: e.clientY };
       this.dragOffset = { x: this.transform.offsetX, y: this.transform.offsetY };
+      const graphPoint = this.clientToGraph(e.clientX, e.clientY);
+      const hit = graphPoint ? this.hitTestNode(graphPoint.x, graphPoint.y) : null;
+      const pos = hit ? this.layout.get(hit.path) : null;
+      this.dragNode = hit && pos ? {
+        path: hit.path,
+        nodeStartX: pos.x,
+        nodeStartY: pos.y,
+        graphStartX: graphPoint!.x,
+        graphStartY: graphPoint!.y,
+      } : null;
     });
-    window.addEventListener("mousemove", (e) => {
+    this.addDomListener(window, "mousemove", (e) => {
       if (!this.dragging) return;
       const dx = e.clientX - this.dragStart.x;
       const dy = e.clientY - this.dragStart.y;
       if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragMoved = true;
       if (!dragMoved) return;
-      this.transform.offsetX = this.dragOffset.x + dx;
-      this.transform.offsetY = this.dragOffset.y + dy;
+      if (this.dragNode) {
+        const graphPoint = this.clientToGraph(e.clientX, e.clientY);
+        if (!graphPoint) return;
+        this.layout.set(this.dragNode.path, {
+          x: this.dragNode.nodeStartX + graphPoint.x - this.dragNode.graphStartX,
+          y: this.dragNode.nodeStartY + graphPoint.y - this.dragNode.graphStartY,
+        });
+      } else {
+        this.transform.offsetX = this.dragOffset.x + dx;
+        this.transform.offsetY = this.dragOffset.y + dy;
+      }
       this.render(parseInt(thresholdSlider.value, 10) / 100);
     });
-    window.addEventListener("mouseup", () => {
+    this.addDomListener(window, "mouseup", async () => {
       this.dragging = false;
+      this.dragNode = null;
       const wasDrag = dragMoved;
       if (wasDrag || !lastMouseDown) return;
       // It was a click (no movement) — open the note.
       const e = lastMouseDown;
-      const rect = this.canvas!.getBoundingClientRect();
-      if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) return;
-      const scaleX = this.canvas!.width / rect.width;
-      const scaleY = this.canvas!.height / rect.height;
-      const sx = (e.clientX - rect.left) * scaleX;
-      const sy = (e.clientY - rect.top) * scaleY;
-      const mx = (sx - this.transform.offsetX) / this.transform.scale;
-      const my = (sy - this.transform.offsetY) / this.transform.scale;
-      for (let i = this.nodeHitAreas.length - 1; i >= 0; i--) {
-        const area = this.nodeHitAreas[i];
-        const dx = mx - area.x;
-        const dy = my - area.y;
-        if (dx * dx + dy * dy <= (area.radius / this.transform.scale) * (area.radius / this.transform.scale)) {
-          const linkText = area.anchor ? area.path + area.anchor : area.path;
-          this.app.workspace.openLinkText(linkText, "", "tab");
-          return;
-        }
-      }
+      lastMouseDown = null;
+      const graphPoint = this.clientToGraph(e.clientX, e.clientY);
+      if (!graphPoint) return;
+      const hit = this.hitTestNode(graphPoint.x, graphPoint.y);
+      if (hit) await this.openFileOnce(hit.path);
     });
 
     // Initial render (all nodes cold).
     this.render(0.1);
 
     // Resize handler.
-    const observer = new ResizeObserver(() => {
+    this.resizeObserver = new ResizeObserver(() => {
       if (this.canvas && canvasContainer) {
         this.canvas.width = canvasContainer.clientWidth || 800;
         this.canvas.height = canvasContainer.clientHeight || 600;
+        this.computeLayout();
+        if (this.searchResult) {
+          this.fitToSearchResult(this.searchResult);
+        }
         this.render(parseInt(thresholdSlider.value, 10) / 100);
       }
     });
-    observer.observe(canvasContainer);
+    this.resizeObserver.observe(canvasContainer);
   }
 
   async onClose(): Promise<void> {
     if (this.animFrameId !== null) {
       cancelAnimationFrame(this.animFrameId);
+      this.animFrameId = null;
     }
+    this.cleanupEventHandlers();
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
   }
 
   // ── Public API ───────────────────────────────────────────
 
   setSearchResult(result: SearchResult): void {
     this.searchResult = result;
+    this.fitToSearchResult(result);
     this.startAnimation();
   }
 
   triggerSearch(query: string): void {
     this.searchResult = this.engine.search(query);
+    this.fitToSearchResult(this.searchResult);
     this.startAnimation();
   }
 
-  // ── Force-directed layout ────────────────────────────────
+  private addDomListener<K extends keyof WindowEventMap>(
+    target: Window,
+    type: K,
+    handler: (event: WindowEventMap[K]) => void
+  ): void;
+  private addDomListener<K extends keyof HTMLElementEventMap>(
+    target: HTMLElement,
+    type: K,
+    handler: (event: HTMLElementEventMap[K]) => void
+  ): void;
+  private addDomListener(
+    target: Window | HTMLElement,
+    type: string,
+    handler: EventListener
+  ): void {
+    target.addEventListener(type, handler);
+    this.cleanupFns.push(() => target.removeEventListener(type, handler));
+  }
 
-  private computeLayout(): void {
-    const nodes: LayoutNode[] = [];
-    const links: LayoutLink[] = [];
-    const nodeMap = new Map<string, LayoutNode>();
+  private cleanupEventHandlers(): void {
+    for (const cleanup of this.cleanupFns.splice(0)) {
+      cleanup();
+    }
+    this.dragging = false;
+  }
 
-    for (const note of this.graph.getAllNodes()) {
-      const node: LayoutNode = { id: note.path, title: note.title };
-      nodes.push(node);
-      nodeMap.set(note.path, node);
+  private async openFileOnce(path: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return;
+
+    const existing = this.app.workspace
+      .getLeavesOfType("markdown")
+      .find((leaf) => (leaf.view as any)?.file?.path === path);
+
+    if (existing) {
+      this.app.workspace.revealLeaf(existing);
+      return;
     }
 
-    for (const edge of this.graph.getAllEdges()) {
-      const source = nodeMap.get(edge.source);
-      const target = nodeMap.get(edge.target);
-      if (source && target) {
-        links.push({ source, target, weight: edge.weight });
+    await this.app.workspace.getLeaf(false).openFile(file);
+  }
+
+  private clientToGraph(clientX: number, clientY: number): LayoutPosition | null {
+    if (!this.canvas) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null;
+    const scaleX = this.canvas.width / rect.width;
+    const scaleY = this.canvas.height / rect.height;
+    const sx = (clientX - rect.left) * scaleX;
+    const sy = (clientY - rect.top) * scaleY;
+    return {
+      x: (sx - this.transform.offsetX) / this.transform.scale,
+      y: (sy - this.transform.offsetY) / this.transform.scale,
+    };
+  }
+
+  private hitTestNode(x: number, y: number): { path: string; anchor?: string } | null {
+    for (let i = this.nodeHitAreas.length - 1; i >= 0; i--) {
+      const area = this.nodeHitAreas[i];
+      const dx = x - area.x;
+      const dy = y - area.y;
+      if (dx * dx + dy * dy <= area.radius * area.radius) {
+        return { path: area.path, anchor: area.anchor };
+      }
+    }
+    return null;
+  }
+
+  private fitToSearchResult(result: SearchResult): void {
+    if (!this.canvas || this.layout.size === 0) return;
+
+    const focusIds = new Set<string>(result.entryIds);
+    for (const [path, activation] of Object.entries(result.activationMap)) {
+      if (activation > 0.05) {
+        focusIds.add(path);
       }
     }
 
-    if (nodes.length === 0) return;
+    const positions = Array.from(focusIds)
+      .map((id) => this.layout.get(id))
+      .filter((pos): pos is LayoutPosition => Boolean(pos));
 
+    if (positions.length === 0) return;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const pos of positions) {
+      minX = Math.min(minX, pos.x);
+      minY = Math.min(minY, pos.y);
+      maxX = Math.max(maxX, pos.x);
+      maxY = Math.max(maxY, pos.y);
+    }
+
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    const padding = 80;
+    const availableWidth = Math.max(120, this.canvas.width - padding * 2);
+    const availableHeight = Math.max(120, this.canvas.height - padding * 2);
+    const boundsWidth = Math.max(1, maxX - minX);
+    const boundsHeight = Math.max(1, maxY - minY);
+    const fitScale = Math.min(availableWidth / boundsWidth, availableHeight / boundsHeight);
+    const scale = Math.max(0.35, Math.min(2.2, fitScale));
+
+    this.transform = {
+      scale,
+      offsetX: this.canvas.width / 2 - centerX * scale,
+      offsetY: this.canvas.height / 2 - centerY * scale,
+    };
+  }
+
+  // ── Stable overview layout ────────────────────────────────
+
+  private computeLayout(): void {
     const cw = this.canvas?.width || 800;
     const ch = this.canvas?.height || 600;
-
-    const sim = forceSimulation<LayoutNode>(nodes)
-      .force("link", forceLink<LayoutNode, LayoutLink>(links).distance(d => 120 / (d.weight * 2)).strength(0.3))
-      .force("charge", forceManyBody().strength(-80))
-      .force("center", forceCenter(cw / 2, ch / 2))
-      .force("collide", forceCollide(this.BASE_RADIUS + 4))
-      .stop();
-
-    // Run simulation synchronously (small graphs < 5000 nodes are fast).
-    for (let i = 0; i < 100; i++) sim.tick();
-
-    // Find bounding box and center the layout.
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const node of nodes) {
-      if (node.x == null || node.y == null) continue;
-      minX = Math.min(minX, node.x); minY = Math.min(minY, node.y);
-      maxX = Math.max(maxX, node.x); maxY = Math.max(maxY, node.y);
+    const cx = cw / 2;
+    const cy = ch / 2;
+    const rx = Math.max(80, cw * 0.44);
+    const ry = Math.max(80, ch * 0.38);
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const degree = new Map<string, number>();
+    for (const edge of this.graph.getAllEdges()) {
+      degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
+      degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
     }
-    const offsetX = cw / 2 - (minX + maxX) / 2;
-    const offsetY = ch / 2 - (minY + maxY) / 2;
 
-    for (const node of nodes) {
-      this.layout.set(node.id, { x: (node.x ?? 0) + offsetX, y: (node.y ?? 0) + offsetY });
+    const notes = [...this.graph.getAllNodes()].sort((a, b) => {
+      const byDegree = (degree.get(b.path) ?? 0) - (degree.get(a.path) ?? 0);
+      if (byDegree !== 0) return byDegree;
+      return a.path.localeCompare(b.path);
+    });
+    this.layout.clear();
+    const denom = Math.max(1, notes.length - 1);
+    notes.forEach((note, i) => {
+      if (i === 0) {
+        this.layout.set(note.path, { x: cx, y: cy });
+        return;
+      }
+      const t = i / denom;
+      const angle = i * golden;
+      const radius = Math.sqrt(t);
+      const degreeNudge = Math.min(0.18, (degree.get(note.path) ?? 0) / Math.max(1, this.graph.getAllEdges().length));
+      this.layout.set(note.path, {
+        x: cx + Math.cos(angle) * rx * Math.max(0.14, radius - degreeNudge),
+        y: cy + Math.sin(angle) * ry * Math.max(0.14, radius - degreeNudge),
+      });
+    });
+
+    this.normalizeLayout(cw, ch);
+  }
+
+  private normalizeLayout(width: number, height: number): void {
+    if (this.layout.size === 0) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const pos of this.layout.values()) {
+      minX = Math.min(minX, pos.x);
+      minY = Math.min(minY, pos.y);
+      maxX = Math.max(maxX, pos.x);
+      maxY = Math.max(maxY, pos.y);
+    }
+    if (!Number.isFinite(minX)) return;
+    const padding = 56;
+    const graphW = Math.max(1, maxX - minX);
+    const graphH = Math.max(1, maxY - minY);
+    const scale = Math.min((width - padding * 2) / graphW, (height - padding * 2) / graphH);
+    if (!Number.isFinite(scale) || scale <= 0) return;
+    const usedW = graphW * scale;
+    const usedH = graphH * scale;
+    const offsetX = (width - usedW) / 2 - minX * scale;
+    const offsetY = (height - usedH) / 2 - minY * scale;
+    for (const [id, pos] of this.layout) {
+      this.layout.set(id, {
+        x: pos.x * scale + offsetX,
+        y: pos.y * scale + offsetY,
+      });
     }
   }
 
   // ── Rendering ────────────────────────────────────────────
+
+  private cssVar(name: string, fallback: string): string {
+    const host = this.canvas ?? this.containerEl;
+    return getComputedStyle(host).getPropertyValue(name).trim() || fallback;
+  }
+
+  private theme(): HeatmapTheme {
+    return {
+      bg: this.cssVar("--background-primary", "#1e1e2e"),
+      grid: this.cssVar("--background-modifier-border", "#343945"),
+      edge: this.cssVar("--text-faint", "#858b96"),
+      node: this.cssVar("--interactive-accent", "#8b8fd4"),
+      nodeInactive: this.cssVar("--text-faint", "#858b96"),
+      text: this.cssVar("--text-normal", "#e0e0e0"),
+      textFaint: this.cssVar("--text-faint", "#aaa"),
+    };
+  }
+
+  private colorWithAlpha(color: string, alpha: number): string {
+    if (color.startsWith("#")) {
+      const hex = color.slice(1);
+      const full = hex.length === 3 ? hex.split("").map((c) => c + c).join("") : hex;
+      const n = Number.parseInt(full, 16);
+      const r = (n >> 16) & 255;
+      const g = (n >> 8) & 255;
+      const b = n & 255;
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+    if (color.startsWith("rgb(")) {
+      return color.replace("rgb", "rgba").replace(")", `, ${alpha})`);
+    }
+    return color;
+  }
 
   private render(minActivation: number): void {
     if (!this.ctx || !this.canvas) return;
     const ctx = this.ctx;
     const w = this.canvas.width;
     const h = this.canvas.height;
+    const theme = this.theme();
 
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = "#1e1e2e";
+    ctx.fillStyle = theme.bg;
     ctx.fillRect(0, 0, w, h);
+
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+    ctx.strokeStyle = theme.grid;
+    ctx.lineWidth = 1;
+    const grid = 48 * this.transform.scale;
+    if (grid > 18) {
+      const startX = ((this.transform.offsetX % grid) + grid) % grid;
+      const startY = ((this.transform.offsetY % grid) + grid) % grid;
+      for (let x = startX; x < w; x += grid) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+      }
+      for (let y = startY; y < h; y += grid) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
 
     // Clear hit areas — repopulated below.
     this.nodeHitAreas = [];
@@ -303,10 +507,14 @@ export class RippleHeatmapView extends ItemView {
     // Build node list with activation data.
     const activationMap = this.searchResult?.activationMap ?? {};
     const activeNodes = new Set(Object.keys(activationMap));
+    const hasActivation = Object.keys(activationMap).length > 0;
+    const degree = new Map<string, number>();
+    for (const edge of this.graph.getAllEdges()) {
+      degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
+      degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
+    }
 
     // Draw edges first.
-    ctx.strokeStyle = "rgba(100, 100, 120, 0.3)";
-    ctx.lineWidth = 0.5;
     for (const edge of this.graph.getAllEdges()) {
       const src = this.layout.get(edge.source);
       const tgt = this.layout.get(edge.target);
@@ -314,12 +522,14 @@ export class RippleHeatmapView extends ItemView {
 
       const srcActive = activationMap[edge.source] ?? 0;
       const tgtActive = activationMap[edge.target] ?? 0;
-      const edgeAlpha = Math.max(srcActive, tgtActive) * 0.6 + 0.15;
+      const isActivated = hasActivation && (srcActive > 0.05 || tgtActive > 0.05);
+      const edgeAlpha = isActivated ? Math.max(srcActive, tgtActive) * 0.55 + 0.08 : edge.weight < 0.5 ? 0.035 : 0.18;
 
       ctx.beginPath();
       ctx.moveTo(src.x, src.y);
       ctx.lineTo(tgt.x, tgt.y);
-      ctx.strokeStyle = `rgba(150, 150, 170, ${edgeAlpha})`;
+      ctx.strokeStyle = this.colorWithAlpha(theme.edge, edgeAlpha);
+      ctx.lineWidth = edge.weight < 0.5 ? 0.45 / this.transform.scale : 0.75 / this.transform.scale;
       ctx.stroke();
     }
 
@@ -331,27 +541,30 @@ export class RippleHeatmapView extends ItemView {
       const activation = activationMap[note.path] ?? 0;
       if (activation < minActivation && !activeNodes.has(note.path)) {
         // Dim inactive nodes.
-        ctx.fillStyle = "#3a3a4a";
+        ctx.fillStyle = theme.nodeInactive;
         ctx.beginPath();
-        ctx.arc(pos.x, pos.y, this.BASE_RADIUS * 0.6, 0, Math.PI * 2);
+        ctx.arc(pos.x, pos.y, 4.8 / this.transform.scale, 0, Math.PI * 2);
         ctx.fill();
         // Still record hit area so cold nodes remain clickable.
-        this.nodeHitAreas.push({ x: pos.x, y: pos.y, radius: 6, path: note.path, anchor: this.bestAnchorFor(note.path) });
+        this.nodeHitAreas.push({ x: pos.x, y: pos.y, radius: 10 / this.transform.scale, path: note.path, anchor: this.bestAnchorFor(note.path) });
         continue;
       }
 
-      const color = this.activationColor(activation);
-      const radius = this.BASE_RADIUS + activation * (this.MAX_RADIUS - this.BASE_RADIUS);
+      const color = hasActivation && activation <= 0 ? theme.nodeInactive : hasActivation ? this.activationColor(activation) : theme.node;
+      const screenRadius = hasActivation
+        ? this.BASE_RADIUS + activation * (this.MAX_RADIUS - this.BASE_RADIUS)
+        : 4.8;
+      const radius = screenRadius / this.transform.scale;
 
       // Record hit area (even cold nodes get a small clickable radius).
       const inAnchor = this.bestAnchorFor(note.path);
-      this.nodeHitAreas.push({ x: pos.x, y: pos.y, radius: Math.max(radius, 6), path: note.path, anchor: inAnchor });
+      this.nodeHitAreas.push({ x: pos.x, y: pos.y, radius: Math.max(radius, 10 / this.transform.scale), path: note.path, anchor: inAnchor });
 
       // Glow for activated nodes.
-      if (activation > 0.1) {
+      if (activation > 0.1 || !hasActivation) {
         ctx.beginPath();
-        ctx.arc(pos.x, pos.y, radius + 4, 0, Math.PI * 2);
-        ctx.fillStyle = color.replace("1)", `${0.15})`).replace("rgb", "rgba");
+        ctx.arc(pos.x, pos.y, radius + 5 / this.transform.scale, 0, Math.PI * 2);
+        ctx.fillStyle = this.colorWithAlpha(color, activation > 0.1 ? 0.16 : 0.1);
         ctx.fill();
       }
 
@@ -363,17 +576,20 @@ export class RippleHeatmapView extends ItemView {
 
       // Border for entry nodes.
       if (this.searchResult?.entryIds.includes(note.path)) {
-        ctx.strokeStyle = "#fff";
-        ctx.lineWidth = 2;
+        ctx.strokeStyle = theme.text;
+        ctx.lineWidth = 2 / this.transform.scale;
         ctx.stroke();
       }
 
-      // Label (only for activated or large nodes).
-      if (activation > 0.2 || radius > 12) {
-        ctx.fillStyle = "#e0e0e0";
-        ctx.font = `${10 + activation * 4}px sans-serif`;
+      // Label (activated or highly connected nodes).
+      if (activation > 0.2 || this.searchResult?.entryIds.includes(note.path) || (!hasActivation && (degree.get(note.path) ?? 0) >= 8)) {
+        ctx.fillStyle = theme.text;
+        ctx.font = `${Math.max(9, 10 / this.transform.scale + activation * 4)}px sans-serif`;
         ctx.textAlign = "center";
-        ctx.fillText(note.title.slice(0, 20), pos.x, pos.y + radius + 12);
+        ctx.shadowColor = this.colorWithAlpha(theme.bg, 0.75);
+        ctx.shadowBlur = 5 / this.transform.scale;
+        ctx.fillText(note.title.slice(0, 20), pos.x, pos.y + radius + 12 / this.transform.scale);
+        ctx.shadowBlur = 0;
       }
     }
 
@@ -381,7 +597,7 @@ export class RippleHeatmapView extends ItemView {
     ctx.restore();
 
     // Legend (screen space).
-    this.drawLegend(ctx, w);
+    this.drawLegend(ctx, w, theme);
   }
 
   // ── Animation ────────────────────────────────────────────
@@ -419,15 +635,19 @@ export class RippleHeatmapView extends ItemView {
     // Highlight active nodes for this frame.
     if (this.ctx && this.canvas) {
       const ctx = this.ctx;
+      const theme = this.theme();
+      ctx.save();
+      ctx.setTransform(this.transform.scale, 0, 0, this.transform.scale, this.transform.offsetX, this.transform.offsetY);
       for (const nodeId of snapshot.activeNodes) {
         const pos = this.layout.get(nodeId);
         if (!pos) continue;
         ctx.beginPath();
-        ctx.arc(pos.x, pos.y, this.MAX_RADIUS + 6, 0, Math.PI * 2);
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.6)";
-        ctx.lineWidth = 2;
+        ctx.arc(pos.x, pos.y, (this.MAX_RADIUS + 6) / this.transform.scale, 0, Math.PI * 2);
+        ctx.strokeStyle = this.colorWithAlpha(theme.text, 0.6);
+        ctx.lineWidth = 2 / this.transform.scale;
         ctx.stroke();
       }
+      ctx.restore();
     }
 
     this.animSnapshotIdx++;
@@ -466,7 +686,7 @@ export class RippleHeatmapView extends ItemView {
     return undefined;
   }
 
-  private drawLegend(ctx: CanvasRenderingContext2D, w: number): void {
+  private drawLegend(ctx: CanvasRenderingContext2D, w: number, theme: HeatmapTheme): void {
     const x = w - 140;
     const y = 20;
     ctx.font = "10px sans-serif";
@@ -476,7 +696,7 @@ export class RippleHeatmapView extends ItemView {
       ctx.fillStyle = color;
       ctx.fillRect(x + i * 12, y, 10, 12);
     }
-    ctx.fillStyle = "#aaa";
+    ctx.fillStyle = theme.textFaint;
     ctx.textAlign = "center";
     ctx.fillText("0%", x + 0, y + 24);
     ctx.fillText("100%", x + 110, y + 24);

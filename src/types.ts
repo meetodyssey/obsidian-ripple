@@ -15,6 +15,8 @@ export interface VaultNote {
   tags: string[];
   /** H1 / H2 headings for entry matching. */
   headings: string[];
+  /** Stable textual references such as discussion-82 or ADR-016. */
+  textRefs: string[];
   /** Last-modified timestamp (ms). */
   mtime: number;
 }

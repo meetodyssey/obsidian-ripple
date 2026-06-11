@@ -217,9 +217,10 @@ export class RippleHeatmapView extends ItemView {
       if (this.canvas && canvasContainer) {
         this.canvas.width = canvasContainer.clientWidth || 800;
         this.canvas.height = canvasContainer.clientHeight || 600;
-        this.computeLayout();
         if (this.searchResult) {
           this.fitToSearchResult(this.searchResult);
+        } else {
+          this.fitToView();
         }
         this.render(parseInt(thresholdSlider.value, 10) / 100);
       }
@@ -360,72 +361,169 @@ export class RippleHeatmapView extends ItemView {
     };
   }
 
-  // ── Stable overview layout ────────────────────────────────
+  // ── Force-directed layout ─────────────────────────────────
+
+  private static readonly LAYOUT_MIN_WEIGHT = 0.5;
+  private static readonly LAYOUT_MAX_EDGES_PER_NODE = 12;
+  private static readonly FULL_REPULSION_NODE_LIMIT = 450;
+  private static readonly SAMPLED_REPULSION_NEIGHBORS = 48;
 
   private computeLayout(): void {
-    const cw = this.canvas?.width || 800;
-    const ch = this.canvas?.height || 600;
-    const cx = cw / 2;
-    const cy = ch / 2;
-    const rx = Math.max(80, cw * 0.44);
-    const ry = Math.max(80, ch * 0.38);
-    const golden = Math.PI * (3 - Math.sqrt(5));
+    const allEdges = this.graph.getAllEdges();
+    const allNodes = [...this.graph.getAllNodes()];
+
     const degree = new Map<string, number>();
-    for (const edge of this.graph.getAllEdges()) {
+    for (const edge of allEdges) {
       degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
       degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
     }
 
-    const notes = [...this.graph.getAllNodes()].sort((a, b) => {
-      const byDegree = (degree.get(b.path) ?? 0) - (degree.get(a.path) ?? 0);
-      if (byDegree !== 0) return byDegree;
-      return a.path.localeCompare(b.path);
-    });
-    this.layout.clear();
-    const denom = Math.max(1, notes.length - 1);
-    notes.forEach((note, i) => {
-      if (i === 0) {
-        this.layout.set(note.path, { x: cx, y: cy });
-        return;
-      }
-      const t = i / denom;
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const N = allNodes.length;
+    if (N === 0) { this.layout.clear(); return; }
+
+    const nodes = allNodes.map((n, i) => {
       const angle = i * golden;
-      const radius = Math.sqrt(t);
-      const degreeNudge = Math.min(0.18, (degree.get(note.path) ?? 0) / Math.max(1, this.graph.getAllEdges().length));
-      this.layout.set(note.path, {
-        x: cx + Math.cos(angle) * rx * Math.max(0.14, radius - degreeNudge),
-        y: cy + Math.sin(angle) * ry * Math.max(0.14, radius - degreeNudge),
-      });
+      const ring = 50 + Math.sqrt(i / Math.max(1, N)) * 600;
+      return { id: n.path, x: Math.cos(angle) * ring, y: Math.sin(angle) * ring, vx: 0, vy: 0 };
     });
 
-    this.normalizeLayout(cw, ch);
+    const nodeSet = new Set(nodes.map((n) => n.id));
+    const nodeMap = new Map<string, (typeof nodes)[0]>();
+    for (const n of nodes) nodeMap.set(n.id, n);
+
+    // Select top edges per node (cap high-degree hubs).
+    const candidates = allEdges
+      .filter((e) => e.weight >= RippleHeatmapView.LAYOUT_MIN_WEIGHT && nodeSet.has(e.source) && nodeSet.has(e.target));
+    candidates.sort((a, b) => b.weight - a.weight);
+    const countByNode = new Map<string, number>();
+    const layoutEdges: typeof candidates = [];
+    for (const e of candidates) {
+      const cs = countByNode.get(e.source) ?? 0;
+      const ct = countByNode.get(e.target) ?? 0;
+      if (cs >= RippleHeatmapView.LAYOUT_MAX_EDGES_PER_NODE || ct >= RippleHeatmapView.LAYOUT_MAX_EDGES_PER_NODE) continue;
+      layoutEdges.push(e);
+      countByNode.set(e.source, cs + 1);
+      countByNode.set(e.target, ct + 1);
+    }
+
+    // Layout degree for attraction normalization.
+    const layoutDeg = new Map<string, number>();
+    for (const e of layoutEdges) {
+      layoutDeg.set(e.source, (layoutDeg.get(e.source) ?? 0) + 1);
+      layoutDeg.set(e.target, (layoutDeg.get(e.target) ?? 0) + 1);
+    }
+
+    const iterations = nodes.length > 1200 ? 120 : nodes.length > 450 ? 180 : 260;
+    for (let iter = 0; iter < iterations; iter++) {
+      const alpha = 1 - iter / iterations;
+
+      this.applyRepulsion(nodes, alpha);
+
+      // Degree-normalized spring attraction along layout edges.
+      for (const e of layoutEdges) {
+        const a = nodeMap.get(e.source), b = nodeMap.get(e.target);
+        if (!a || !b) continue;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const minDeg = Math.min(layoutDeg.get(e.source) ?? 1, layoutDeg.get(e.target) ?? 1);
+        const strength = 0.05 / Math.max(1, minDeg);
+        const idealDist = 80 + (1 - e.weight) * 60;
+        const f = (dist - idealDist) * strength * alpha / dist;
+        a.vx += dx * f; a.vy += dy * f;
+        b.vx -= dx * f; b.vy -= dy * f;
+      }
+
+      // Center gravity — stronger for isolated nodes.
+      for (const n of nodes) {
+        const d = degree.get(n.id) ?? 0;
+        const pull = d > 0 ? 0.01 : 0.03;
+        n.vx -= n.x * pull * alpha;
+        n.vy -= n.y * pull * alpha;
+      }
+
+      // Apply velocities (d3: velocityDecay = 0.4 → multiply by 0.6).
+      for (const n of nodes) {
+        n.x += n.vx; n.y += n.vy;
+        n.vx *= 0.6; n.vy *= 0.6;
+      }
+    }
+
+    this.layout.clear();
+    for (const n of nodes) {
+      if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) { n.x = 0; n.y = 0; }
+      this.layout.set(n.id, { x: n.x, y: n.y });
+    }
+    this.fitToView();
   }
 
-  private normalizeLayout(width: number, height: number): void {
-    if (this.layout.size === 0) return;
+  private applyRepulsion(
+    nodes: Array<{ id: string; x: number; y: number; vx: number; vy: number }>,
+    alpha: number
+  ): void {
+    if (nodes.length <= RippleHeatmapView.FULL_REPULSION_NODE_LIMIT) {
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          this.applyPairRepulsion(nodes[i], nodes[j], alpha, 30);
+        }
+      }
+      return;
+    }
+
+    // Large vaults cannot afford O(n^2) repulsion on the UI thread. Sample a
+    // deterministic set of distant neighbors to keep layout responsive.
+    const n = nodes.length;
+    const samples = Math.min(RippleHeatmapView.SAMPLED_REPULSION_NEIGHBORS, n - 1);
+    const stride = Math.max(1, Math.floor(n / samples));
+    const scaledStrength = 30 * Math.sqrt(n / samples);
+    for (let i = 0; i < n; i++) {
+      for (let s = 1; s <= samples; s++) {
+        const j = (i + s * stride) % n;
+        if (j === i) continue;
+        this.applyPairRepulsion(nodes[i], nodes[j], alpha, scaledStrength);
+      }
+    }
+  }
+
+  private applyPairRepulsion(
+    a: { x: number; y: number; vx: number; vy: number },
+    b: { x: number; y: number; vx: number; vy: number },
+    alpha: number,
+    strength: number
+  ): void {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    const w = strength * alpha / dist;
+    const fx = (dx / dist) * w;
+    const fy = (dy / dist) * w;
+    a.vx -= fx; a.vy -= fy;
+    b.vx += fx; b.vy += fy;
+  }
+
+  private fitToView(): void {
+    if (!this.canvas || this.layout.size === 0) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const pos of this.layout.values()) {
-      minX = Math.min(minX, pos.x);
-      minY = Math.min(minY, pos.y);
-      maxX = Math.max(maxX, pos.x);
-      maxY = Math.max(maxY, pos.y);
+      minX = Math.min(minX, pos.x); minY = Math.min(minY, pos.y);
+      maxX = Math.max(maxX, pos.x); maxY = Math.max(maxY, pos.y);
     }
     if (!Number.isFinite(minX)) return;
-    const padding = 56;
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const padding = 48;
     const graphW = Math.max(1, maxX - minX);
     const graphH = Math.max(1, maxY - minY);
-    const scale = Math.min((width - padding * 2) / graphW, (height - padding * 2) / graphH);
-    if (!Number.isFinite(scale) || scale <= 0) return;
-    const usedW = graphW * scale;
-    const usedH = graphH * scale;
-    const offsetX = (width - usedW) / 2 - minX * scale;
-    const offsetY = (height - usedH) / 2 - minY * scale;
-    for (const [id, pos] of this.layout) {
-      this.layout.set(id, {
-        x: pos.x * scale + offsetX,
-        y: pos.y * scale + offsetY,
-      });
-    }
+    const rawScale = Math.min((w - padding * 2) / graphW, (h - padding * 2) / graphH);
+    const scale = Math.max(0.1, Math.min(5, rawScale));
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    this.transform = {
+      scale,
+      offsetX: w / 2 - cx * scale,
+      offsetY: h / 2 - cy * scale,
+    };
   }
 
   // ── Rendering ────────────────────────────────────────────
